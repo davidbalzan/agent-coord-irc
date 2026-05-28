@@ -1,6 +1,7 @@
 import type { Socket } from "node:net";
-import { timingSafeEqual } from "node:crypto";
-import { formatLine, type IrcMessage } from "./protocol.js";
+import { timingSafeEqual, randomBytes } from "node:crypto";
+import { formatLine, formatLineWithTags, type IrcMessage } from "./protocol.js";
+import { loadChannelHistory, loadInboxHistory } from "./history.js";
 import {
   upsertAgent,
   removeAgent,
@@ -30,8 +31,14 @@ const PING_INTERVAL_MS = 60_000;
 const PING_TIMEOUT_MS = 30_000;
 const DEFAULT_CHANNEL = "#general";
 
-// Empty cap list for now — message-tags / server-time / chathistory come later.
-const SUPPORTED_CAPS: string[] = [];
+const SUPPORTED_CAPS = [
+  "message-tags",
+  "server-time",
+  "batch",
+  "draft/chathistory",
+];
+
+const CHATHISTORY_MAX = 200;
 
 export interface ServerContext {
   hostname: string;
@@ -49,6 +56,7 @@ export class Client {
   passSubmitted: string | null = null;
   capNegotiating = false;
   capsRequested: string[] = [];
+  caps: Set<string> = new Set();
   buf = "";
   closed = false;
   // Channel name (incl. "#") → last known topicVersion seen by this client.
@@ -189,6 +197,12 @@ export class Client {
           return;
         }
         return this.onTopic(msg);
+      case "CHATHISTORY":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onChatHistory(msg);
       default:
         if (this.state !== "REGISTERED") {
           this.sendNumeric("451", ["You have not registered"]);
@@ -461,15 +475,14 @@ export class Client {
         this.capNegotiating = true;
         this.send("CAP", [this.nick ?? "*", "LS", SUPPORTED_CAPS.join(" ")]);
         return;
-      case "LIST":
-        this.send("CAP", [this.nick ?? "*", "LIST", ""]);
-        return;
       case "REQ": {
         const reqStr = msg.params[1] ?? "";
         const requested = reqStr.split(" ").filter(Boolean);
         this.capsRequested = requested;
-        // Empty supported set → NAK anything requested (none for now).
         const allOk = requested.every((c) => SUPPORTED_CAPS.includes(c));
+        if (allOk) {
+          for (const c of requested) this.caps.add(c);
+        }
         this.send("CAP", [
           this.nick ?? "*",
           allOk ? "ACK" : "NAK",
@@ -477,6 +490,9 @@ export class Client {
         ]);
         return;
       }
+      case "LIST":
+        this.send("CAP", [this.nick ?? "*", "LIST", [...this.caps].join(" ")]);
+        return;
       case "END":
         this.capNegotiating = false;
         await this.maybeComplete();
@@ -552,6 +568,7 @@ export class Client {
       "NETWORK=agent-coord",
       "CHANTYPES=#",
       "NICKLEN=32",
+      `CHATHISTORY=${CHATHISTORY_MAX}`,
       "are supported",
     ]);
     this.sendNumeric("422", ["MOTD File is missing"]);
@@ -566,6 +583,155 @@ export class Client {
 
     await this.ctx.hub.addInboxClient(this);
     this.startTimers();
+  }
+
+  private chatHistoryError(sub: string, target: string | undefined, msg: string): void {
+    const params = target ? [this.nick!, "CHATHISTORY", sub, target, msg] : [this.nick!, "CHATHISTORY", sub, msg];
+    this.send("400", params);
+  }
+
+  private async onChatHistory(msg: IrcMessage): Promise<void> {
+    if (!this.caps.has("draft/chathistory")) {
+      this.sendNumeric("421", ["CHATHISTORY", "Unknown command"]);
+      return;
+    }
+    const sub = (msg.params[0] ?? "").toUpperCase();
+    if (!sub) {
+      this.send("400", [this.nick!, "CHATHISTORY", "Subcommand required"]);
+      return;
+    }
+    if (sub === "AROUND" || sub === "TARGETS") {
+      this.chatHistoryError(sub, undefined, "Subcommand not implemented");
+      return;
+    }
+    if (!["LATEST", "BEFORE", "AFTER", "BETWEEN"].includes(sub)) {
+      this.chatHistoryError(sub, undefined, "Unknown subcommand");
+      return;
+    }
+    const target = msg.params[1];
+    if (!target) {
+      this.sendNumeric("461", ["CHATHISTORY", sub, "Not enough parameters"]);
+      return;
+    }
+
+    // Resolve target → entries.
+    let entries: { id?: string; ts: number; from: string; text: string }[];
+    if (target.startsWith("#")) {
+      if (!this.joined.has(target)) {
+        this.sendNumeric("442", [target, "You're not on that channel"]);
+        return;
+      }
+      entries = await loadChannelHistory(target);
+    } else {
+      if (target.toLowerCase() !== this.nick!.toLowerCase()) {
+        this.chatHistoryError(sub, target, "Cannot fetch other users' history");
+        return;
+      }
+      entries = await loadInboxHistory(this.nick!);
+    }
+
+    // Parse criteria + limit.
+    const parseTs = (s: string): number | null => {
+      if (!s.startsWith("timestamp=")) return null;
+      const iso = s.slice("timestamp=".length);
+      const ms = Date.parse(iso);
+      return Number.isNaN(ms) ? null : ms;
+    };
+    const parseLimit = (s: string): number | null => {
+      const n = Number(s);
+      if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+      if (n < 1 || n > CHATHISTORY_MAX) return null;
+      return n;
+    };
+
+    let result: typeof entries = [];
+    if (sub === "LATEST") {
+      const criterion = msg.params[2] ?? "*";
+      const limit = parseLimit(msg.params[3] ?? "");
+      if (limit === null) {
+        this.chatHistoryError(sub, target, "Invalid limit");
+        return;
+      }
+      if (criterion === "*") {
+        result = entries.slice(-limit);
+      } else {
+        const ts = parseTs(criterion);
+        if (ts === null) {
+          this.chatHistoryError(sub, target, "Invalid timestamp format");
+          return;
+        }
+        result = entries.filter((e) => e.ts > ts).slice(-limit);
+      }
+    } else if (sub === "BEFORE") {
+      const ts = parseTs(msg.params[2] ?? "");
+      const limit = parseLimit(msg.params[3] ?? "");
+      if (ts === null) {
+        this.chatHistoryError(sub, target, "Invalid timestamp format");
+        return;
+      }
+      if (limit === null) {
+        this.chatHistoryError(sub, target, "Invalid limit");
+        return;
+      }
+      result = entries.filter((e) => e.ts < ts).slice(-limit);
+    } else if (sub === "AFTER") {
+      const ts = parseTs(msg.params[2] ?? "");
+      const limit = parseLimit(msg.params[3] ?? "");
+      if (ts === null) {
+        this.chatHistoryError(sub, target, "Invalid timestamp format");
+        return;
+      }
+      if (limit === null) {
+        this.chatHistoryError(sub, target, "Invalid limit");
+        return;
+      }
+      result = entries.filter((e) => e.ts > ts).slice(0, limit);
+    } else if (sub === "BETWEEN") {
+      const ts1 = parseTs(msg.params[2] ?? "");
+      const ts2 = parseTs(msg.params[3] ?? "");
+      const limit = parseLimit(msg.params[4] ?? "");
+      if (ts1 === null || ts2 === null) {
+        this.chatHistoryError(sub, target, "Invalid timestamp format");
+        return;
+      }
+      if (limit === null) {
+        this.chatHistoryError(sub, target, "Invalid limit");
+        return;
+      }
+      const lo = Math.min(ts1, ts2);
+      const hi = Math.max(ts1, ts2);
+      result = entries.filter((e) => e.ts > lo && e.ts < hi).slice(0, limit);
+    }
+
+    this.emitChatHistory(target, result);
+  }
+
+  private emitChatHistory(
+    target: string,
+    entries: { ts: number; from: string; text: string }[],
+  ): void {
+    const useBatch = this.caps.has("batch");
+    const useTime = this.caps.has("server-time");
+    const batchId = randomBytes(6).toString("hex");
+    if (useBatch) {
+      this.send("BATCH", [`+${batchId}`, "chathistory", target]);
+    }
+    for (const entry of entries) {
+      const iso = new Date(entry.ts).toISOString();
+      const prefix = `${entry.from}!${entry.from}@coord`;
+      const lines = entry.text.split("\n");
+      for (const line of lines) {
+        if (line.length === 0) continue;
+        const tags: Record<string, string> = {};
+        if (useTime) tags["time"] = iso;
+        if (useBatch) tags["batch"] = batchId;
+        if (this.closed) return;
+        this.socket.write(formatLineWithTags(tags, prefix, "PRIVMSG", [target, line]));
+      }
+    }
+    if (useBatch) {
+      this.send("BATCH", [`-${batchId}`]);
+    }
   }
 
   private startTimers(): void {

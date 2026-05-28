@@ -90,6 +90,29 @@ export function drainBuffer(buf: string): { messages: IrcMessage[]; rest: string
   return { messages, rest: buf.slice(cursor) };
 }
 
+export function formatLineWithTags(
+  tags: Record<string, string>,
+  prefix: string | undefined,
+  command: string,
+  params: string[],
+): string {
+  const tagParts: string[] = [];
+  for (const [k, v] of Object.entries(tags)) {
+    tagParts.push(v === "" ? k : `${k}=${escapeTagValue(v)}`);
+  }
+  const tagPrefix = tagParts.length > 0 ? "@" + tagParts.join(";") + " " : "";
+  return tagPrefix + formatLine(prefix, command, params);
+}
+
+function escapeTagValue(v: string): string {
+  return v
+    .replace(/\\/g, "\\\\")
+    .replace(/;/g, "\\:")
+    .replace(/ /g, "\\s")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
+}
+
 export function formatLine(prefix: string | undefined, command: string, params: string[]): string {
   const parts: string[] = [];
   if (prefix) parts.push(`:${prefix}`);
