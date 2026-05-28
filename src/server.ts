@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 import { drainBuffer } from "./protocol.js";
-import { Client, type ServerContext } from "./client.js";
+import { Client, type ServerContext } from "./client/index.js";
 import { Hub } from "./hub.js";
 import { ensureChannel } from "./channels.js";
 

@@ -4,7 +4,7 @@ import {
   type ChannelMessage,
 } from "./channels.js";
 import { FilePoller } from "./watcher.js";
-import type { Client } from "./client.js";
+import type { Client } from "./client/index.js";
 
 interface ChannelRuntime {
   poller: FilePoller;
