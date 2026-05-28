@@ -67,8 +67,18 @@ function parseCli(argv: string[]): Cli {
 }
 
 function printUsage(): void {
+  const tlsDir = path.join(os.homedir(), "agent-coord", "tls");
   process.stderr.write(
-    `Usage: agent-coord-irc [--bind 127.0.0.1] [--port 6667] [--tls-port 6697 --tls-cert PATH --tls-key PATH]\n`,
+    `Usage: agent-coord-irc [flags]\n` +
+      `\n` +
+      `  --bind <addr>       Address to bind both listeners to. Default: 127.0.0.1\n` +
+      `  --port <n>          Plain (TCP) listener port.          Default: 6667\n` +
+      `  --tls-port <n>      TLS listener port (opt-in).         Default: off\n` +
+      `  --tls-cert <path>   PEM cert for TLS listener.          Default: ${path.join(tlsDir, "cert.pem")}\n` +
+      `  --tls-key <path>    PEM key for TLS listener.           Default: ${path.join(tlsDir, "key.pem")}\n` +
+      `  -h, --help          Print this and exit.\n` +
+      `\n` +
+      `Quickstart and threat-model notes: https://github.com/davidbalzan/agent-coord-irc#readme\n`,
   );
 }
 
