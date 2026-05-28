@@ -1,0 +1,45 @@
+{
+  "name": "agent-coord-irc",
+  "version": "0.1.0",
+  "description": "Embedded IRC server bolt-on for agent-coord-mcp — exposes the local file-backed bus over the network using standard IRC protocol.",
+  "type": "module",
+  "bin": {
+    "agent-coord-irc": "dist/server.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "ROADMAP.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/davidbalzan/agent-coord-irc.git"
+  },
+  "license": "MIT",
+  "author": "David Balzan",
+  "keywords": [
+    "irc",
+    "ircd",
+    "mcp",
+    "agent-coord",
+    "agents",
+    "multi-agent",
+    "chat"
+  ],
+  "peerDependencies": {
+    "agent-coord-mcp": ">=0.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0"
+  }
+}
