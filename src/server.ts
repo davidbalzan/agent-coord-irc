@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 import { drainBuffer } from "./protocol.js";
 import { Client, type ServerContext } from "./client.js";
+import { Hub } from "./hub.js";
+import { ensureChannel } from "./channels.js";
 
 const HOST = "127.0.0.1";
 const PORT = 6667;
@@ -38,7 +40,9 @@ async function main(): Promise<void> {
     version,
     startedAtIso: new Date().toISOString(),
     clientsByNick: new Map(),
+    hub: new Hub(),
   };
+  await ensureChannel("#general");
 
   const server = createServer((socket) => {
     socket.setEncoding("utf8");

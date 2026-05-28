@@ -8,6 +8,19 @@ import {
   listAgentIds,
   readServerPass,
 } from "./registry.js";
+import {
+  addMember,
+  appendChannelMessage,
+  appendInboxMessage,
+  channelBase,
+  ensureChannel,
+  isValidChannelName,
+  listChannels,
+  readChannel,
+  removeMember,
+  setTopic,
+} from "./channels.js";
+import type { Hub } from "./hub.js";
 
 export type ClientState = "PENDING" | "CAP_NEGOTIATING" | "REGISTERED";
 
@@ -15,6 +28,7 @@ const NICK_RE = /^[A-Za-z][A-Za-z0-9._\-]{0,31}$/;
 const HEARTBEAT_MS = 30_000;
 const PING_INTERVAL_MS = 60_000;
 const PING_TIMEOUT_MS = 30_000;
+const DEFAULT_CHANNEL = "#general";
 
 // Empty cap list for now — message-tags / server-time / chathistory come later.
 const SUPPORTED_CAPS: string[] = [];
@@ -24,6 +38,7 @@ export interface ServerContext {
   version: string;
   startedAtIso: string;
   clientsByNick: Map<string, Client>; // lowercase nick → client
+  hub: Hub;
 }
 
 export class Client {
@@ -36,6 +51,8 @@ export class Client {
   capsRequested: string[] = [];
   buf = "";
   closed = false;
+  // Channel name (incl. "#") → last known topicVersion seen by this client.
+  joined: Map<string, number> = new Map();
 
   private lastPongTs = Date.now();
   private pingToken: string | null = null;
@@ -50,9 +67,22 @@ export class Client {
     this.socket.write(formatLine(prefix ?? this.ctx.hostname, command, params));
   }
 
+  /** Send with an explicit prefix (e.g. another user's nick!user@host). */
+  sendRaw(prefix: string, command: string, params: string[]): void {
+    if (this.closed) return;
+    this.socket.write(formatLine(prefix, command, params));
+  }
+
   sendNumeric(code: string, params: string[]): void {
     const target = this.nick ?? "*";
     this.send(code, [target, ...params]);
+  }
+
+  /** "nick!user@host" prefix for messages originating from this client. */
+  userPrefix(): string {
+    const n = this.nick ?? "*";
+    const u = this.user ?? n;
+    return `${n}!${u}@coord`;
   }
 
   async close(reason?: string): Promise<void> {
@@ -70,6 +100,18 @@ export class Client {
     if (this.state === "REGISTERED" && this.nick) {
       this.ctx.clientsByNick.delete(this.nick.toLowerCase());
       nickToRemove = this.nick;
+      // Detach from all channels and inbox poller.
+      for (const channel of this.joined.keys()) {
+        this.ctx.hub.removeChannelClient(channel, this);
+        // Also drop membership from sidecar so list_agents / NAMES reflect it.
+        try {
+          await removeMember(channel, this.nick);
+        } catch {
+          /* ignore */
+        }
+      }
+      this.joined.clear();
+      this.ctx.hub.removeInboxClient(this.nick);
     }
     if (nickToRemove) {
       try {
@@ -111,13 +153,255 @@ export class Client {
       case "QUIT":
         await this.close(`Quit: ${msg.params[0] ?? "client quit"}`);
         return;
+      case "JOIN":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onJoin(msg);
+      case "PART":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onPart(msg);
+      case "PRIVMSG":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onPrivmsg(msg);
+      case "NAMES":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onNames(msg);
+      case "LIST":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onList(msg);
+      case "TOPIC":
+        if (this.state !== "REGISTERED") {
+          this.sendNumeric("451", ["You have not registered"]);
+          return;
+        }
+        return this.onTopic(msg);
       default:
         if (this.state !== "REGISTERED") {
           this.sendNumeric("451", ["You have not registered"]);
         } else {
-          // Unimplemented in task 2 — channels/messages come in task 3.
           this.sendNumeric("421", [msg.command, "Unknown command"]);
         }
+    }
+  }
+
+  private async onJoin(msg: IrcMessage): Promise<void> {
+    if (msg.params.length < 1) {
+      this.sendNumeric("461", ["JOIN", "Not enough parameters"]);
+      return;
+    }
+    const targets = msg.params[0].split(",").map((s) => s.trim()).filter(Boolean);
+    for (const channel of targets) {
+      if (!isValidChannelName(channel)) {
+        this.sendNumeric("403", [channel, "No such channel"]);
+        continue;
+      }
+      if (this.joined.has(channel)) continue;
+      const state = await addMember(channel, this.nick!);
+      this.joined.set(channel, state.topicVersion);
+      await this.ctx.hub.addChannelClient(channel, this);
+
+      // Echo JOIN to self.
+      this.sendRaw(this.userPrefix(), "JOIN", [channel]);
+
+      // Topic numerics.
+      if (state.topic && state.topic.length > 0) {
+        this.sendNumeric("332", [channel, state.topic]);
+        if (state.topicSetBy && state.topicSetAt) {
+          this.send("333", [
+            this.nick!,
+            channel,
+            state.topicSetBy,
+            String(state.topicSetAt),
+          ]);
+        }
+      } else {
+        this.sendNumeric("331", [channel, "No topic is set"]);
+      }
+
+      // MOTD as channel NOTICE.
+      if (state.motd && state.motd.length > 0) {
+        for (const line of state.motd.split("\n")) {
+          this.sendRaw(this.ctx.hostname, "NOTICE", [channel, line]);
+        }
+      }
+
+      // NAMES.
+      this.sendNumeric("353", ["=", channel, state.members.join(" ")]);
+      this.sendNumeric("366", [channel, "End of /NAMES list"]);
+
+      // Broadcast to other in-channel IRC clients.
+      const prefix = this.userPrefix();
+      for (const peer of this.ctx.hub.activeMembers(channel)) {
+        if (peer === this) continue;
+        peer.sendRaw(prefix, "JOIN", [channel]);
+      }
+    }
+  }
+
+  private async onPart(msg: IrcMessage): Promise<void> {
+    if (msg.params.length < 1) {
+      this.sendNumeric("461", ["PART", "Not enough parameters"]);
+      return;
+    }
+    const targets = msg.params[0].split(",").map((s) => s.trim()).filter(Boolean);
+    const reason = msg.params[1];
+    for (const channel of targets) {
+      if (!this.joined.has(channel)) {
+        this.sendNumeric("442", [channel, "You're not on that channel"]);
+        continue;
+      }
+      const prefix = this.userPrefix();
+      // Broadcast PART (including to self) BEFORE detaching, so peers see it.
+      for (const peer of this.ctx.hub.activeMembers(channel)) {
+        peer.sendRaw(prefix, "PART", reason ? [channel, reason] : [channel]);
+      }
+      this.ctx.hub.removeChannelClient(channel, this);
+      this.joined.delete(channel);
+      try {
+        await removeMember(channel, this.nick!);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private async onPrivmsg(msg: IrcMessage): Promise<void> {
+    if (msg.params.length < 1) {
+      this.sendNumeric("411", ["No recipient given (PRIVMSG)"]);
+      return;
+    }
+    if (msg.params.length < 2 || msg.params[1].length === 0) {
+      this.sendNumeric("412", ["No text to send"]);
+      return;
+    }
+    const target = msg.params[0];
+    const text = msg.params[1];
+    if (target.startsWith("#")) {
+      if (!isValidChannelName(target)) {
+        this.sendNumeric("401", [target, "No such nick/channel"]);
+        return;
+      }
+      if (!this.joined.has(target)) {
+        this.sendNumeric("404", [target, "Cannot send to channel"]);
+        return;
+      }
+      // Append per line; the file poller will deliver to other IRC members.
+      for (const line of text.split("\n")) {
+        if (line.length === 0) continue;
+        await appendChannelMessage(target, this.nick!, line);
+      }
+    } else {
+      for (const line of text.split("\n")) {
+        if (line.length === 0) continue;
+        await appendInboxMessage(target, this.nick!, line);
+      }
+      // Live delivery if recipient is connected here (inbox poller would also
+      // pick it up, but a direct write keeps latency tight).
+      const peer = this.ctx.clientsByNick.get(target.toLowerCase());
+      if (peer) {
+        for (const line of text.split("\n")) {
+          if (line.length === 0) continue;
+          peer.sendRaw(this.userPrefix(), "PRIVMSG", [target, line]);
+        }
+      }
+    }
+  }
+
+  private async onNames(msg: IrcMessage): Promise<void> {
+    const list = msg.params[0]
+      ? msg.params[0].split(",").map((s) => s.trim()).filter(Boolean)
+      : [...this.joined.keys()];
+    for (const channel of list) {
+      if (!isValidChannelName(channel)) continue;
+      const state = await readChannel(channel);
+      this.sendNumeric("353", ["=", channel, state.members.join(" ")]);
+      this.sendNumeric("366", [channel, "End of /NAMES list"]);
+    }
+  }
+
+  private async onList(msg: IrcMessage): Promise<void> {
+    const requested = msg.params[0]
+      ? msg.params[0].split(",").map((s) => s.trim()).filter(Boolean)
+      : null;
+    this.sendNumeric("321", ["Channel", "Users  Name"]);
+    const channels = requested ?? (await listChannels());
+    for (const channel of channels) {
+      if (!isValidChannelName(channel)) continue;
+      const state = await readChannel(channel);
+      this.sendNumeric("322", [
+        channel,
+        String(state.members.length),
+        state.topic ?? "",
+      ]);
+    }
+    this.sendNumeric("323", ["End of /LIST"]);
+  }
+
+  private async onTopic(msg: IrcMessage): Promise<void> {
+    if (msg.params.length < 1) {
+      this.sendNumeric("461", ["TOPIC", "Not enough parameters"]);
+      return;
+    }
+    const channel = msg.params[0];
+    if (!isValidChannelName(channel)) {
+      this.sendNumeric("403", [channel, "No such channel"]);
+      return;
+    }
+    if (msg.params.length === 1) {
+      const state = await readChannel(channel);
+      if (state.topic && state.topic.length > 0) {
+        this.sendNumeric("332", [channel, state.topic]);
+        if (state.topicSetBy && state.topicSetAt) {
+          this.send("333", [
+            this.nick!,
+            channel,
+            state.topicSetBy,
+            String(state.topicSetAt),
+          ]);
+        }
+      } else {
+        this.sendNumeric("331", [channel, "No topic is set"]);
+      }
+      return;
+    }
+    if (!this.joined.has(channel)) {
+      this.sendNumeric("442", [channel, "You're not on that channel"]);
+      return;
+    }
+    const newTopic = msg.params[1];
+    const expected = this.joined.get(channel) ?? 0;
+    const result = await setTopic(channel, this.nick!, newTopic, expected);
+    if (!result.ok) {
+      this.joined.set(channel, result.current.topicVersion);
+      const setter = result.current.topicSetBy ?? "another agent";
+      this.sendRaw(this.ctx.hostname, "NOTICE", [
+        channel,
+        `topic changed by ${setter} — your TOPIC was rejected, /topic to see current`,
+      ]);
+      return;
+    }
+    this.joined.set(channel, result.state.topicVersion);
+    const prefix = this.userPrefix();
+    for (const peer of this.ctx.hub.activeMembers(channel)) {
+      peer.sendRaw(prefix, "TOPIC", [channel, newTopic]);
+      // peers must also refresh their topicVersion baseline for future sets.
+      if (peer !== this && peer.joined.has(channel)) {
+        peer.joined.set(channel, result.state.topicVersion);
+      }
     }
   }
 
@@ -280,6 +564,7 @@ export class Client {
       capabilities: ["irc-attached"],
     });
 
+    await this.ctx.hub.addInboxClient(this);
     this.startTimers();
   }
 
