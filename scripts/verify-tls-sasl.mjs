@@ -74,6 +74,7 @@ function makeLineReader(socket) {
     }
   });
   socket.on("close", () => (state.closed = true));
+  socket.on("error", () => {}); // server-initiated close on shutdown is fine
   return state;
 }
 
@@ -264,10 +265,6 @@ async function run() {
   // ---- scenario 9: SASL replaces PASS ----
   {
     process.stdout.write("\n[scenario 9] server-pass + sasl-users.json coexist\n");
-    // Clean agents.json — earlier scenarios may have left stale entries because
-    // SIGTERM doesn't wait for in-flight removeAgent writes. This is a real
-    // shutdown-robustness issue worth fixing separately; for now, isolate.
-    writeFileSync(path.join(coordDir, "agents.json"), "{}");
     writeFileSync(path.join(coordDir, "server-pass"), "secret");
     const { child } = await startServer({
       coordDir,
@@ -333,7 +330,6 @@ async function run() {
   // ---- scenario 10: plain + TLS clients coexist + PRIVMSG cross-listener ----
   {
     process.stdout.write("\n[scenario 10] plain client + TLS client in same #test channel\n");
-    writeFileSync(path.join(coordDir, "agents.json"), "{}");
     const { child } = await startServer({
       coordDir,
       extraArgs: ["--tls-port", "6697", "--tls-cert", certPath, "--tls-key", keyPath],

@@ -100,6 +100,7 @@ function attachConnection(socket: Socket, ctx: ServerContext, isTls: boolean): v
   socket.setEncoding("utf8");
   const client = new Client(socket, ctx);
   client.tls = isTls;
+  ctx.allClients.add(client);
 
   socket.on("data", (chunk: string) => {
     client.buf += chunk;
@@ -129,6 +130,7 @@ async function main(): Promise<void> {
     version,
     startedAtIso: new Date().toISOString(),
     clientsByNick: new Map(),
+    allClients: new Set(),
     hub: new Hub(),
   };
   await ensureChannel("#general");
@@ -177,14 +179,25 @@ async function main(): Promise<void> {
     });
   }
 
-  const shutdown = (sig: string) => {
+  let shuttingDown = false;
+  const shutdown = async (sig: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     process.stderr.write(`received ${sig}, shutting down\n`);
+    // Stop accepting new connections.
     plain.close();
     tlsServer?.close();
-    setTimeout(() => process.exit(0), 100);
+    // Drain currently-attached clients — close() awaits registry cleanup
+    // (removeAgent + sidecar member removal) so we don't leave stale state.
+    const closing: Promise<void>[] = [];
+    for (const client of [...ctx.allClients]) {
+      closing.push(client.close("Server shutting down"));
+    }
+    await Promise.allSettled(closing);
+    process.exit(0);
   };
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {

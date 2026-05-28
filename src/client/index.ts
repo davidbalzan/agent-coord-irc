@@ -34,6 +34,7 @@ export interface ServerContext {
   version: string;
   startedAtIso: string;
   clientsByNick: Map<string, Client>; // lowercase nick → client
+  allClients: Set<Client>;            // every connected client, regardless of state
   hub: Hub;
 }
 
@@ -101,6 +102,7 @@ export class Client {
   async close(reason?: string): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.ctx.allClients.delete(this);
     if (reason) {
       try {
         this.socket.write(formatLine(undefined, "ERROR", [reason]));
