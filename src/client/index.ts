@@ -11,6 +11,7 @@ import {
   handleCap,
   handlePing,
   handlePong,
+  handleAuthenticate,
 } from "./handshake.js";
 import {
   handleJoin,
@@ -48,6 +49,14 @@ export class Client {
   buf = "";
   closed = false;
   joined: Map<string, number> = new Map();
+
+  /** Transport flag — set to true for clients on the TLS listener. */
+  tls = false;
+  /** SASL state. */
+  saslMechanism: string | null = null;
+  saslInProgress = false;
+  saslAuthcid: string | null = null;
+  saslAborted = false;
 
   lastPongTs = Date.now();
   pingToken: string | null = null;
@@ -166,6 +175,8 @@ export class Client {
         return handleUser(this, msg);
       case "CAP":
         return handleCap(this, msg);
+      case "AUTHENTICATE":
+        return handleAuthenticate(this, msg);
       case "PING":
         return handlePing(this, msg);
       case "PONG":
