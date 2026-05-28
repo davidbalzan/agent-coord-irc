@@ -14,8 +14,9 @@
     "ROADMAP.md"
   ],
   "scripts": {
-    "build": "tsc",
-    "prepare": "tsc",
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
+    "prepare": "npm run clean && tsc",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts"
   },
@@ -34,6 +35,9 @@
     "multi-agent",
     "chat"
   ],
+  "engines": {
+    "node": ">=20"
+  },
   "peerDependencies": {
     "agent-coord-mcp": ">=0.4.0"
   },
